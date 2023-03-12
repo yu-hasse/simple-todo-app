@@ -1,17 +1,18 @@
 package main
 
 import (
-	"database/sql"
 	"encoding/json"
+	"log"
 	"net/http"
 	"time"
 
-	_ "github.com/go-sql-driver/mysql"
+	"github.com/gin-gonic/gin"
+	"gorm.io/driver/mysql"
+	"gorm.io/gorm"
 )
 
-var Layout = "2006/01/02"
+var gormDB *gorm.DB
 
-var DB *sql.DB
 var todos []TodoObj = []TodoObj{}
 
 type TodoObj struct {
@@ -25,80 +26,67 @@ type MetaData struct {
 }
 
 type Todo struct {
+	gorm.Model
 	Author      string    `json:"author"`
 	Name        string    `json:"name"`
 	Description string    `json:"description"`
 	DueDate     time.Time `json:"dueDate"`
 }
 
-func list(w http.ResponseWriter, r *http.Request) {
-	rows, err := DB.Query("SELECT * FROM todos")
-	if err != nil {
-		panic(err)
-	}
-	defer rows.Close()
+func list(c *gin.Context) {
+	todos := make([]Todo, 0)
 
-	todos := make([]TodoObj, 0)
-	for rows.Next() {
-		var todo TodoObj
-		if err := rows.Scan(&todo.ID, &todo.Author, &todo.Name, &todo.Description, &todo.DueDate, &todo.CreatedAt); err != nil {
-			panic(err)
-		}
-		todos = append(todos, todo)
+	if err := gormDB.WithContext(c).Find(&todos).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 	}
 
-	_ = json.NewEncoder(w).Encode(todos)
+	c.JSON(http.StatusOK, todos)
 }
 
-func add(w http.ResponseWriter, r *http.Request) {
-	encoder := json.NewEncoder(w)
-	if r.Body == http.NoBody {
-		_ = encoder.Encode("request body is empty")
+func add(c *gin.Context) {
+	if c.Request.Body == http.NoBody {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "body is required"})
 		return
 	}
 
 	var todo Todo
-	if err := json.NewDecoder(r.Body).Decode(&todo); err != nil {
-		_ = encoder.Encode(err.Error())
+	if err := json.NewDecoder(c.Request.Body).Decode(&todo); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "body is invalid"})
 		return
 	}
 
-	obj := TodoObj{
-		MetaData: MetaData{
-			CreatedAt: time.Now(),
-		},
-		Todo: todo,
-	}
-	result, err := DB.Exec("INSERT INTO todos (author, name, description, due_date, created_at) VALUES (?,?,?,?,?)", obj.Author, obj.Name, obj.Description, obj.DueDate.Format("2006-01-02 15:03:04"), obj.CreatedAt.Format("2006-01-02 15:03:04"))
-	if err != nil {
-		panic(err)
+	if err := gormDB.WithContext(c).Create(&todo).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 	}
 
-	lastInsertID, err := result.LastInsertId()
-	if err != nil {
-		panic(err)
-	}
-	var responseData TodoObj
-	if err := DB.QueryRow("SELECT * FROM todos WHERE id=?", lastInsertID).Scan(&responseData.ID, &responseData.Author, &responseData.Name, &responseData.Description, &responseData.DueDate, &responseData.CreatedAt); err != nil {
-		panic(err)
-	}
-	_ = encoder.Encode(obj)
+	c.JSON(http.StatusOK, todo)
+}
+
+func setupRouter() *gin.Engine {
+	router := gin.Default()
+	router.GET("/todos", list)
+	router.POST("/todo", add)
+	return router
 }
 
 func main() {
-	db, err := sql.Open("mysql", "root:mysql@tcp(127.0.0.1:3306)/todo?parseTime=true")
+	_gormDB, err := gorm.Open(mysql.Open("root:mysql@tcp(127.0.0.1:3306)/todo?parseTime=true"), &gorm.Config{})
+	if err != nil {
+		panic(err)
+	}
+	db, err := _gormDB.DB()
 	if err != nil {
 		panic(err)
 	}
 	defer db.Close()
-	if err := db.Ping(); err != nil {
-		panic(err)
+
+	if !_gormDB.Migrator().HasTable(&Todo{}) {
+		if err := _gormDB.Migrator().CreateTable(&Todo{}); err != nil {
+			panic(err)
+		}
 	}
 
-	if _, err := DB.Exec("CREATE TABLE IF NOT EXISTS todos(id INTEGER AUTO_INCREMENT, author VARCHAR(32), name VARCHAR(32), description VARCHAR(64), due_date DATETIME, created_at DATETIME, PRIMARY KEY (id))"); err != nil {
-		panic(err)
-	}
-	http.HandleFunc("/todo/list", list)
-	http.HandleFunc("/todo/add", add)
-	http.ListenAndServe(":8080", nil)
+	gormDB = _gormDB
+
+	log.Println(setupRouter().Run(":8080"))
 }
