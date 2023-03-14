@@ -4,29 +4,22 @@ import (
 	"encoding/json"
 	"log"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/redis/go-redis/v9"
 	"gorm.io/driver/mysql"
 	"gorm.io/gorm"
 )
 
 var gormDB *gorm.DB
 
-var todos []TodoObj = []TodoObj{}
-
-type TodoObj struct {
-	MetaData
-	Todo
-}
-
-type MetaData struct {
-	ID        int       `json:"id"`
-	CreatedAt time.Time `json:"createdAt"`
-}
+var redisClient *redis.Client
 
 type Todo struct {
 	gorm.Model
+	UserID      int       `json:"userID"`
 	Author      string    `json:"author"`
 	Name        string    `json:"name"`
 	Description string    `json:"description"`
@@ -34,9 +27,29 @@ type Todo struct {
 }
 
 func list(c *gin.Context) {
+	userID := c.Param("user_id")
+
 	todos := make([]Todo, 0)
 
-	if err := gormDB.WithContext(c).Find(&todos).Error; err != nil {
+	// 最初にredisから取得する
+	if b, err := redisClient.Get(c, userID).Bytes(); err == nil {
+		if err := json.Unmarshal(b, &todos); err == nil {
+			c.JSON(http.StatusOK, todos)
+			return
+		}
+	}
+
+	if err := gormDB.WithContext(c).Find(&todos, "user_id = ?", userID).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+	}
+
+	j, err := json.Marshal(todos)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	if err := redisClient.Set(c, userID, j, 5*time.Minute).Err(); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 	}
 
@@ -59,12 +72,15 @@ func add(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 	}
 
+	if err := redisClient.Del(c, strconv.Itoa(todo.UserID)).Err(); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+	}
 	c.JSON(http.StatusOK, todo)
 }
 
 func setupRouter() *gin.Engine {
 	router := gin.Default()
-	router.GET("/todos", list)
+	router.GET("/todos/:user_id", list)
 	router.POST("/todo", add)
 	return router
 }
@@ -87,6 +103,12 @@ func main() {
 	}
 
 	gormDB = _gormDB
+
+	redisClient = redis.NewClient(&redis.Options{
+		Addr:     "localhost:6379",
+		Password: "",
+		DB:       0,
+	})
 
 	log.Println(setupRouter().Run(":8080"))
 }
